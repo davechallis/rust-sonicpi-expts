@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::{env, io};
 use tokio::sync;
 use tokio::net::UdpSocket;
@@ -44,126 +43,190 @@ fn unix_to_timetag(unix_secs: u64, unix_micros: u32) -> (u32, u32) {
 struct Server {
     socket: UdpSocket,
     buf: Vec<u8>,
+
+    /// Maps a tag name to sender/receiver pair. Used for signalling cancellations.
+    tags: HashMap<String, (sync::watch::Sender<bool>, sync::watch::Receiver<bool>)>,
 }
 
 impl Server {
     // TODO: implement server constructor
     // fn new() -> Self { }
 
-    async fn run(self) -> Result<(), io::Error> {
-        let Server { mut socket, mut buf } = self;
+    pub async fn new(bind_addr: &str) -> Result<Self, io::Error> {
+        debug!("Attempting to bind to: {}", bind_addr);
+        let socket = UdpSocket::bind(bind_addr).await?;
+        info!("Listening on: {}", socket.local_addr()?);
+        Ok(Self {
+            socket,
+            buf: vec![0; 1024],
+            tags: HashMap::new(),
+        })
+    }
 
-        // TODO: move to server constructor
-        // Maps a tag name to sender/receiver pair. Used for signalling cancellations.
-        let mut tags: HashMap<&str, (sync::watch::Sender<bool>, sync::watch::Receiver<bool>)> = HashMap::new();
-
+    async fn run(&mut self) -> Result<(), io::Error> {
         debug!("Starting main event loop");
         loop {
             debug!("Waiting on OSC message...");
-            let (size, _) = socket.recv_from(&mut buf).await?;
+            let (size, _) = self.socket.recv_from(&mut self.buf).await?;
 
             // TODO: error handling for badly formed OSC messages
-            let osccmd = rosc::decoder::decode(&buf[..size]).expect("OSC decoding failed");
+            let osccmd = rosc::decoder::decode(&self.buf[..size]).expect("OSC decoding failed");
+
             match osccmd {
                 rosc::OscPacket::Message(msg) => {
                     debug!("Received OSC Message: {:?}", msg);
 
-                    // TODO: parse `/flush` messages to get specific tags, currently hardcoded to "foo"
-                    let tag = "foo";
-
-                    // Remove tag entry from hash map, and send termination signal to all listening
-                    // receivers.
-                    if let Some((_k, (tx, _rx))) = tags.remove_entry(tag) {
-                        debug!("Flushing tag: {}", tag);
-                        tx.broadcast(true).unwrap_or_else(|e| {
-                            warn!("Failed to broadcast: {}", e);
-                        });
+                    match msg.addr.as_ref() {
+                        "/flush" => self.handle_msg_flush(&msg),
+                        addr => warn!("Ignoring unhandled OSC address: {}", addr),
                     }
                 },
                 rosc::OscPacket::Bundle(bundle) => {
                     if let rosc::OscType::Time(a, b) = bundle.timetag {
-                        let (_tx, rx) = tags.entry("foo").or_insert(tokio::sync::watch::channel(false));
 
                         debug!("Received OSC Bundle: {:?}", bundle);
-                        let dur = timetag_to_duration(a, b);
 
-                        debug!("Sending OSC command in: {}ms", dur.as_millis());
-
-                        let mut rx2 = rx.clone();
-                        tokio::spawn(async move {
-                            // TODO: better way of doing this, configurable addr, etc.
-                            let loopback = std::net::Ipv4Addr::new(127, 0, 0, 1);
-                            let addr = std::net::SocketAddrV4::new(loopback, 0);
-
-                            // TODO: error handling
-                            let mut socket2 = UdpSocket::bind(addr).await.unwrap();
-
-                            // TODO: `watch.recv` always receives the initial channel value - look
-                            // for better way of handling this, rather than just reading/ignoring
-                            // then looping
-                            let mut done = false;
-                            while !done {
-                                select! {
-                                    _ = tokio::time::delay_for(dur).fuse() => {
-                                        // `break;` will not work here, but look for better
-                                        // alternative
-                                        done = true;
-                                    },
-                                    cancel = rx2.recv().fuse() => {
-                                        match cancel {
-                                            Some(true) => {
-                                                debug!("cancelled timer");
-                                                return;
+                        match bundle.content.first() {
+                            Some(rosc::OscPacket::Message(msg)) => {
+                                match msg.addr.as_ref() {
+                                    "/send_after" => {
+                                        // TODO: find out general expected format, and parse
+                                        let target_addr = match Self::parse_command_address(&msg.args) {
+                                            Ok(a) => a,
+                                            Err(e) => {
+                                                warn!("Ignoring message: {}", e);
+                                                continue;
                                             },
-                                            _ => {
-                                                // only needed to handle `false` values, i.e. to
-                                                // ignore initial state of the watch
+                                        };
+
+                                        // TODO: rename to clarify difference between host/port
+                                        // addr and OSX /<foo> addr
+                                        let new_addr = match msg.args.get(2) {
+                                            Some(rosc::OscType::String(new_addr)) => new_addr,
+                                            other => {
+                                                warn!("Unexpected addr argument: {:?}", other);
+                                                continue;
                                             },
-                                        }
+                                        };
+
+                                        let remaining_args = &msg.args[3..];
+                                        let (_tx, rx) = self.tags.entry("default".to_owned()).or_insert(tokio::sync::watch::channel(false));
+                                        let dur = timetag_to_duration(a, b);
+                                        debug!("Sending OSC command in: {}ms", dur.as_millis());
+
+                                        // TODO: parse bundle structure to determine what to send, this just
+                                        // sends fixed message for testing.
+                                        let new_msg = rosc::OscMessage {
+                                            addr: new_addr.to_owned(),
+                                            args: remaining_args.to_vec(),
+                                        };
+                                        let packet = rosc::OscPacket::Message(new_msg);
+
+                                        // TODO: error handling
+                                        let new_buf = rosc::encoder::encode(&packet).expect("encoding failed");
+                                        let mut rx2 = rx.clone();
+
+                                        tokio::spawn(async move {
+                                            // TODO: better way of doing this, configurable addr, etc.
+                                            let loopback = std::net::Ipv4Addr::new(127, 0, 0, 1);
+                                            let addr = std::net::SocketAddrV4::new(loopback, 0);
+
+                                            // TODO: error handling
+                                            let mut socket2 = UdpSocket::bind(addr).await.unwrap();
+
+                                            // TODO: `watch.recv` always receives the initial channel value - look
+                                            // for better way of handling this, rather than just reading/ignoring
+                                            // then looping
+                                            let mut done = false;
+                                            while !done {
+                                                select! {
+                                                    _ = tokio::time::delay_for(dur).fuse() => {
+                                                        // `break;` will not work here, but look for better
+                                                        // alternative
+                                                        done = true;
+                                                    },
+                                                    cancel = rx2.recv().fuse() => {
+                                                        match cancel {
+                                                            Some(true) => {
+                                                                debug!("cancelled timer");
+                                                                return;
+                                                            },
+                                                            _ => {
+                                                                // only needed to handle `false` values, i.e. to
+                                                                // ignore initial state of the watch
+                                                            },
+                                                        }
+                                                    },
+                                                }
+                                            }
+
+                                            // TODO: error handling
+                                            debug!("Sending OSC command to: {}", &target_addr);
+                                            socket2.send_to(&new_buf, &target_addr).await.expect("send to failed!");
+                                            debug!("OSC command sent");
+                                        });
+
                                     },
+                                    "/send_after_tagged" => warn!("not yet implemented: /send_after_tagged"),
+                                    addr => warn!("Ignoring unhandled OSC address: {}", addr),
                                 }
-                            }
-
-                            // TODO: parse bundle structure to determine what to send, this just
-                            // sends fixed message for testing.
-                            let new_msg = rosc::OscMessage {
-                                addr: "/*/note_on".to_owned(),
-                                args: vec![rosc::OscType::Int(-1),
-                                           rosc::OscType::Int(40),
-                                           rosc::OscType::Int(127)],
-                            };
-                            let packet = rosc::OscPacket::Message(new_msg);
-
-                            // TODO: error handling
-                            let new_buf = rosc::encoder::encode(&packet).expect("encoding failed");
-
-                            // TODO: addr should be configurable here
-                            // TODO: error handling
-                            socket2.send_to(&new_buf, "127.0.0.1:4561").await.expect("send to failed!");
-                            debug!("OSC command sent");
-                        });
+                            },
+                            other => warn!("Unexpected OSC bundle content: {:?}", other),
+                        }
                     }
                 },
             }
         }
     }
+
+    /// Handles /flush messages.
+    fn handle_msg_flush(&mut self, msg: &rosc::OscMessage) {
+        match msg.args.first() {
+            Some(rosc::OscType::String(tag)) => {
+                // Remove tag entry from hash map, and send termination signal to all listening
+                // receivers.
+                if let Some((_k, (tx, _rx))) = self.tags.remove_entry(tag) {
+                    debug!("Flushing tag: {}", tag);
+                    tx.broadcast(true).unwrap_or_else(|e| {
+                        warn!("Failed to broadcast: {}", e);
+                    });
+                }
+            },
+            other => warn!("Ignoring unexpected /flush message: {:?}", other),
+        };
+    }
+
+    // TODO: error type
+    /// Parse OSC server address (host and port) from given OSC message arguments (typically from
+    /// `/send_after` messages).
+    fn parse_command_address(msg_args: &[rosc::OscType]) -> Result<String, String> {
+        let host = match msg_args.first() {
+            Some(rosc::OscType::String(host)) => {
+                // Workaround for https://github.com/rust-lang/rust/issues/34202
+                // affecting OS X / Windows
+                // TODO: check v6 status of Sonic Pi
+                if host == "localhost" {
+                    "127.0.0.1"
+                } else {
+                    host
+                }
+            },
+            other => return Err(format!("Unexpected host argument: {:?}", other)),
+        };
+
+        let port = match msg_args.get(1) {
+            Some(rosc::OscType::Int(port)) => port,
+            other => return Err(format!("Unexpected port argument: {:?}", other)),
+        };
+
+        Ok(format!("{}:{}", host, port))
+    }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), io::Error> {
     env_logger::init();
 
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:4560".to_string());
-
-    debug!("Attempting to bind to: {}", &addr);
-    let socket = UdpSocket::bind(&addr).await?;
-    info!("Listening on: {}", socket.local_addr()?);
-
-    let server = Server {
-        socket,
-        buf: vec![0; 1024],
-    };
-
-    server.run().await?;
-    Ok(())
+    Server::new(&addr).await?.run().await
 }
