@@ -14,6 +14,8 @@ use std::collections::HashMap;
 // (53 * 365 + 17 * 366) * 86400 = 2208988800.
 const EPOCH_DELTA: u64 = 2_208_988_800;
 
+const DEFAULT_TAG: &str = "default";
+
 // TODO: verify time conversions are actually correct, check against other implementations
 fn timetag_to_unix(ntp_secs: u32, ntp_frac_secs: u32) -> (u64, u32) {
     let unix_secs = ntp_secs as u64 - EPOCH_DELTA;
@@ -90,10 +92,20 @@ impl Server {
                             Some(rosc::OscPacket::Message(msg)) => {
                                 match msg.addr.as_ref() {
                                     "/send_after" => self.handle_bundle_send_after(
+                                        DEFAULT_TAG,
                                         timetag_to_duration(ntp_secs, ntp_subsecs),
                                         &msg.args
                                     ),
-                                    "/send_after_tagged" => warn!("not yet implemented: /send_after_tagged"),
+                                    "/send_after_tagged" => {
+                                        match Self::parse_send_after_tag(&msg.args) {
+                                            Ok(tag) => self.handle_bundle_send_after(
+                                                &tag,
+                                                timetag_to_duration(ntp_secs, ntp_subsecs),
+                                                &msg.args[1..],
+                                            ),
+                                            Err(err) => warn!("Unexpected tag argument: {}", err),
+                                        }
+                                    },
                                     addr => warn!("Ignoring unhandled OSC address: {}", addr),
                                 }
                             },
@@ -122,7 +134,7 @@ impl Server {
         };
     }
 
-    fn handle_bundle_send_after(&mut self, send_after: Duration, msg_args: &[rosc::OscType]) {
+    fn handle_bundle_send_after(&mut self, tag: &str, send_after: Duration, msg_args: &[rosc::OscType]) {
         // TODO: find out general expected format, and parse
         let udp_addr = match Self::parse_command_address(msg_args) {
             Ok(addr) => addr,
@@ -142,7 +154,7 @@ impl Server {
         };
 
         let remaining_args = &msg_args[3..];
-        let (_tx, rx) = self.tags.entry("default".to_owned()).or_insert(tokio::sync::watch::channel(false));
+        let (_tx, rx) = self.tags.entry(tag.to_owned()).or_insert(tokio::sync::watch::channel(false));
 
         debug!("Sending OSC command {:?} in: {}ms", remaining_args, send_after.as_millis());
 
@@ -197,6 +209,13 @@ impl Server {
             socket2.send_to(&new_buf, &udp_addr).await.expect("send to failed!");
             debug!("OSC command sent");
         });
+    }
+
+    fn parse_send_after_tag(msg_args: &[rosc::OscType]) -> Result<String, String> {
+        match msg_args.first() {
+            Some(rosc::OscType::String(tag)) => Ok(tag.to_owned()),
+            other => Err(format!("Unexpected tag argument: {:?}", other)),
+        }
     }
 
     // TODO: error type
