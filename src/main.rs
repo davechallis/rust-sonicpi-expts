@@ -51,9 +51,6 @@ struct Server {
 }
 
 impl Server {
-    // TODO: implement server constructor
-    // fn new() -> Self { }
-
     pub async fn new(bind_addr: &str) -> Result<Self, io::Error> {
         debug!("Attempting to bind to: {}", bind_addr);
         let socket = UdpSocket::bind(bind_addr).await?;
