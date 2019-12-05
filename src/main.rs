@@ -1,7 +1,8 @@
-use std::{env, io};
+use std::{env, io, fmt};
+use std::time::Duration;
+use std::error::Error;
 use tokio::sync;
 use tokio::net::UdpSocket;
-use std::time::Duration;
 use chrono::offset::TimeZone;
 use log::{debug, info, warn};
 use futures::select;
@@ -72,72 +73,83 @@ impl Server {
         })
     }
 
-    // TODO: extract main event functionality into separate function, using common error
-    // type to handle failures. Implement from/into etc. for error conversions to simplify control
-    // flow.
+    /// Main event loop, runs forever after server is started.
     async fn run(&mut self) -> Result<(), io::Error> {
         debug!("Starting main event loop");
         loop {
-            debug!("Waiting for UDP packet...");
-            let raw_packet = match self.recv_udp_packet().await {
-                Ok(packet) => packet,
-                Err(err) => {
-                    warn!("Socket recv failed: {}", err);
-                    continue;
-                }
-            };
-            debug!("Received UDP packet (size={})", raw_packet.len());
-
-            debug!("Parsing OSC packet...");
-            let osc_packet = match rosc::decoder::decode(raw_packet) {
-                Ok(packet) => packet,
-                Err(err) => {
-                    warn!("Failed to parse OSC packet: {:?}", err);
-                    continue;
-                }
-            };
-            debug!("Received OSC packet: {:?}", osc_packet);
-
-            match osc_packet {
-                rosc::OscPacket::Message(msg) => {
-                    match msg.addr.as_ref() {
-                        "/flush" => self.handle_msg_flush(&msg),
-                        addr => warn!("Ignoring unhandled OSC address: {}", addr),
-                    }
-                },
-                rosc::OscPacket::Bundle(bundle) => {
-                    if let rosc::OscType::Time(ntp_secs, ntp_subsecs) = bundle.timetag {
-                        match bundle.content.first() {
-                            Some(rosc::OscPacket::Message(msg)) => {
-                                match msg.addr.as_ref() {
-                                    "/send_after" => self.handle_bundle_send_after(
-                                        DEFAULT_TAG,
-                                        timetag_to_duration(ntp_secs, ntp_subsecs),
-                                        &msg.args
-                                    ),
-                                    "/send_after_tagged" => {
-                                        match Self::parse_send_after_tag(&msg.args) {
-                                            Ok(tag) => self.handle_bundle_send_after(
-                                                &tag,
-                                                timetag_to_duration(ntp_secs, ntp_subsecs),
-                                                &msg.args[1..],
-                                            ),
-                                            Err(err) => warn!("Unexpected tag argument: {}", err),
-                                        }
-                                    },
-                                    addr => warn!("Ignoring unhandled OSC address: {}", addr),
-                                }
-                            },
-                            other => warn!("Unexpected OSC bundle content: {:?}", other),
-                        }
-                    }
-                },
+            if let Err(err) = self.next_event().await {
+                warn!("{}", err);
             }
         }
     }
 
     /// Await UDP packet. Returns slice into server's buffer.
-    async fn recv_udp_packet(&mut self) -> io::Result<&[u8]> {
+
+    /// Called from main server event loop (`run()`) on each iteration.
+    ///
+    /// Waits for incoming UDP packets containing OSC packets, either handling them immediately (in
+    /// the case of e.g. `/flush` messages), or spawning futures to handle them in the future (in
+    /// the case of e.g. `/send_after` bundles).
+    async fn next_event(&mut self) -> Result<(), ServerError> {
+        debug!("Waiting for UDP packet...");
+        let raw_packet = self.recv_udp_packet().await?;
+        debug!("Received UDP packet (size={})", raw_packet.len());
+
+        debug!("Parsing OSC packet...");
+        let osc_packet = rosc::decoder::decode(raw_packet)?;
+        debug!("Received OSC packet: {:?}", osc_packet);
+
+        match osc_packet {
+            rosc::OscPacket::Message(msg) => {
+                match msg.addr.as_ref() {
+                    "/flush" => self.handle_msg_flush(&msg),
+                    addr => {
+                        let msg = format!("Ignoring unhandled OSC address: {}", addr);
+                        return Err(ServerError::ProtocolError(msg));
+                    }
+                }
+            },
+            rosc::OscPacket::Bundle(bundle) => {
+                if let rosc::OscType::Time(ntp_secs, ntp_subsecs) = bundle.timetag {
+                    match bundle.content.first() {
+                        Some(rosc::OscPacket::Message(msg)) => {
+                            match msg.addr.as_ref() {
+                                "/send_after" => self.handle_bundle_send_after(
+                                    DEFAULT_TAG,
+                                    timetag_to_duration(ntp_secs, ntp_subsecs),
+                                    &msg.args
+                                ),
+                                "/send_after_tagged" => {
+                                    match Self::parse_send_after_tag(&msg.args) {
+                                        Ok(tag) => self.handle_bundle_send_after(
+                                            &tag,
+                                            timetag_to_duration(ntp_secs, ntp_subsecs),
+                                            &msg.args[1..], // 1st argument is tag, already parsed
+                                        ),
+                                        Err(err) => {
+                                            let msg = format!("Unexpected tag argument: {}", err);
+                                            return Err(ServerError::ProtocolError(msg));
+                                        },
+                                    }
+                                },
+                                addr => {
+                                    let msg = format!("Unhandled OSC address: {}", addr);
+                                    return Err(ServerError::ProtocolError(msg));
+                                },
+                            }
+                        },
+                        other => {
+                            let msg = format!("Unexpected OSC bundle content: {:?}", other);
+                            return Err(ServerError::ProtocolError(msg));
+                        }
+                    }
+                }
+            },
+        }
+
+        Ok(())
+    }
+    async fn recv_udp_packet(&mut self) -> Result<&[u8], io::Error> {
         let (size, _) = self.socket.recv_from(&mut self.buf).await?;
         Ok(&self.buf[..size])
     }
@@ -269,6 +281,44 @@ impl Server {
         Ok(format!("{}:{}", host, port))
     }
 }
+
+#[derive(Debug)]
+enum ServerError {
+    /// Network error, typically caused by UDP send/recv here.
+    IoError(io::Error),
+
+    /// OSC error, typically caused by failing to encode/decode OSC data structures.
+    OscError(rosc::OscError),
+
+    /// Error in cases where valid OSC packets were received, but containing invalid payloads (e.g.
+    /// a `/send_after` containing unexpected arguments).
+    ProtocolError(String),
+}
+
+impl fmt::Display for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::IoError(err) => write!(f, "IO error: {}", err),
+            Self::OscError(err) => write!(f, "Failed to decode OSC packet: {:?}", err),
+            Self::ProtocolError(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+impl Error for ServerError {}
+
+impl From<io::Error> for ServerError {
+    fn from(err: io::Error) -> Self {
+        Self::IoError(err)
+    }
+}
+
+impl From<rosc::OscError> for ServerError {
+    fn from(err: rosc::OscError) -> Self {
+        Self::OscError(err)
+    }
+}
+
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
