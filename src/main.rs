@@ -14,8 +14,15 @@ use std::collections::HashMap;
 // (53 * 365 + 17 * 366) * 86400 = 2208988800.
 const EPOCH_DELTA: u64 = 2_208_988_800;
 
+// Tag name to use for messages without an explicit tag (i.e. currently those sent via
+// `/send_after`).
 const DEFAULT_TAG: &str = "default";
 
+// Convert an OSC timetag into unix timestamp seconds and microseconds.
+//
+// [OSC timetags](http://opensoundcontrol.org/spec-1_0) use NTP timestamps
+// (https://en.wikipedia.org/wiki/Network_Time_Protocol#Timestamps).
+//
 // TODO: verify time conversions are actually correct, check against other implementations
 fn timetag_to_unix(ntp_secs: u32, ntp_frac_secs: u32) -> (u64, u32) {
     let unix_secs = ntp_secs as u64 - EPOCH_DELTA;
@@ -43,7 +50,10 @@ fn unix_to_timetag(unix_secs: u64, unix_micros: u32) -> (u32, u32) {
 */
 
 struct Server {
+    /// Server's listening UDP socket.
     socket: UdpSocket,
+
+    /// Internal buffer used for reading/writing UDP packets into.
     buf: Vec<u8>,
 
     /// Maps a tag name to sender/receiver pair. Used for signalling cancellations.
@@ -62,19 +72,34 @@ impl Server {
         })
     }
 
+    // TODO: extract main event functionality into separate function, using common error
+    // type to handle failures. Implement from/into etc. for error conversions to simplify control
+    // flow.
     async fn run(&mut self) -> Result<(), io::Error> {
         debug!("Starting main event loop");
         loop {
-            debug!("Waiting on OSC message...");
-            let (size, _) = self.socket.recv_from(&mut self.buf).await?;
+            debug!("Waiting for UDP packet...");
+            let raw_packet = match self.recv_udp_packet().await {
+                Ok(packet) => packet,
+                Err(err) => {
+                    warn!("Socket recv failed: {}", err);
+                    continue;
+                }
+            };
+            debug!("Received UDP packet (size={})", raw_packet.len());
 
-            // TODO: error handling for badly formed OSC messages
-            let osccmd = rosc::decoder::decode(&self.buf[..size]).expect("OSC decoding failed");
+            debug!("Parsing OSC packet...");
+            let osc_packet = match rosc::decoder::decode(raw_packet) {
+                Ok(packet) => packet,
+                Err(err) => {
+                    warn!("Failed to parse OSC packet: {:?}", err);
+                    continue;
+                }
+            };
+            debug!("Received OSC packet: {:?}", osc_packet);
 
-            match osccmd {
+            match osc_packet {
                 rosc::OscPacket::Message(msg) => {
-                    debug!("Received OSC Message: {:?}", msg);
-
                     match msg.addr.as_ref() {
                         "/flush" => self.handle_msg_flush(&msg),
                         addr => warn!("Ignoring unhandled OSC address: {}", addr),
@@ -82,9 +107,6 @@ impl Server {
                 },
                 rosc::OscPacket::Bundle(bundle) => {
                     if let rosc::OscType::Time(ntp_secs, ntp_subsecs) = bundle.timetag {
-
-                        debug!("Received OSC Bundle: {:?}", bundle);
-
                         match bundle.content.first() {
                             Some(rosc::OscPacket::Message(msg)) => {
                                 match msg.addr.as_ref() {
@@ -112,6 +134,12 @@ impl Server {
                 },
             }
         }
+    }
+
+    /// Await UDP packet. Returns slice into server's buffer.
+    async fn recv_udp_packet(&mut self) -> io::Result<&[u8]> {
+        let (size, _) = self.socket.recv_from(&mut self.buf).await?;
+        Ok(&self.buf[..size])
     }
 
     /// Handles /flush messages.
