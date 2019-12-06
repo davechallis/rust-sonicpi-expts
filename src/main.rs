@@ -86,8 +86,6 @@ impl Server {
         }
     }
 
-    /// Await UDP packet. Returns slice into server's buffer.
-
     /// Called from main server event loop (`run()`) on each iteration.
     ///
     /// Waits for incoming UDP packets containing OSC packets, either handling them immediately (in
@@ -152,6 +150,8 @@ impl Server {
 
         Ok(())
     }
+
+    /// Await UDP packet. Returns slice into server's buffer.
     async fn recv_udp_packet(&mut self) -> Result<&[u8], io::Error> {
         let (size, _) = self.socket.recv_from(&mut self.buf).await?;
         Ok(&self.buf[..size])
