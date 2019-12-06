@@ -1,13 +1,12 @@
 use std::{env, io, fmt};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::error::Error;
+use std::collections::HashMap;
 use tokio::sync;
 use tokio::net::UdpSocket;
-use chrono::offset::TimeZone;
 use log::{debug, info, warn};
 use futures::select;
 use futures::future::FutureExt;
-use std::collections::HashMap;
 
 
 // Delta between NTP epoch (1900-01-01 00:00:00) and Unix epoch (1970-01-01 00:00:00).
@@ -35,11 +34,15 @@ fn timetag_to_unix(ntp_secs: u32, ntp_frac_secs: u32) -> (u64, u32) {
 fn timetag_to_duration(ntp_secs: u32, ntp_frac_secs: u32) -> Duration {
     let (unix_secs, unix_micros) = timetag_to_unix(ntp_secs, ntp_frac_secs);
 
-    // TODO: can this be done with SystemTime to avoid `chrono` dependency?
-    let dur = chrono::Utc.timestamp(unix_secs as i64, unix_micros * 1000) - chrono::Utc::now();
+    // duration of time tag since epoch
+    let tt_since_epoch = Duration::new(unix_secs, unix_micros * 1000);
 
-    // TODO: error handling, can occur on negative timestamps, or on overflow
-    dur.to_std().expect("failed to convert duration")
+    // duration of current system time since epoch
+    let now_since_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("System is set to before Unix epoch, check clock");
+
+    tt_since_epoch - now_since_epoch
 }
 
 /*
