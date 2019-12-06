@@ -11,7 +11,8 @@ jobs:
         with:
           command: build
           args: --verbose
- test:
+ 
+  test:
     name: Test
     runs-on: ubuntu-latest
     steps:
