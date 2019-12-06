@@ -174,8 +174,8 @@ impl Server {
         };
     }
 
+    /// Handles /send_after and /send_after_tagged bundles.
     fn handle_bundle_send_after(&mut self, tag: &str, send_after: Duration, msg_args: &[rosc::OscType]) {
-        // TODO: find out general expected format, and parse
         let udp_addr = match Self::parse_command_address(msg_args) {
             Ok(addr) => addr,
             Err(err) => {
@@ -193,22 +193,27 @@ impl Server {
             },
         };
 
+        // remove host, port, address from command
         let remaining_args = &msg_args[3..];
-        let (_tx, rx) = self.tags.entry(tag.to_owned()).or_insert(tokio::sync::watch::channel(false));
 
         debug!("Sending OSC command {:?} in: {}ms", remaining_args, send_after.as_millis());
-
-        // TODO: parse bundle structure to determine what to send, this just
-        // sends fixed message for testing.
         let new_msg = rosc::OscMessage {
             addr: osc_cmd_addr.to_owned(),
             args: remaining_args.to_vec(),
         };
-        let packet = rosc::OscPacket::Message(new_msg);
 
-        // TODO: error handling
-        let new_buf = rosc::encoder::encode(&packet).expect("encoding failed");
-        let mut rx2 = rx.clone();
+        let packet = rosc::OscPacket::Message(new_msg);
+        let new_buf = match rosc::encoder::encode(&packet) {
+            Ok(buf) => buf,
+            Err(err) => {
+                warn!("Failed to encode requested OSC message: {:?}", err);
+                return;
+            }
+        };
+
+        let (_tx, rx) = self.tags.entry(tag.to_owned())
+            .or_insert(tokio::sync::watch::channel(false));
+        let mut rx = rx.clone();
 
         tokio::spawn(async move {
             // TODO: better way of doing this, configurable addr, etc.
@@ -216,29 +221,26 @@ impl Server {
             let addr = std::net::SocketAddrV4::new(loopback, 0);
 
             // TODO: error handling
-            let mut socket2 = UdpSocket::bind(addr).await.unwrap();
+            let mut socket = UdpSocket::bind(addr).await.unwrap();
 
-            // TODO: `watch.recv` always receives the initial channel value - look
-            // for better way of handling this, rather than just reading/ignoring
-            // then looping
-            let mut done = false;
-            while !done {
+            // check if already cancelled, disregard initial value if not
+            if let Some(true) = rx.recv().await {
+                debug!("cancelled timer");
+                return;
+            }
+
+            loop {
                 select! {
-                    _ = tokio::time::delay_for(send_after).fuse() => {
-                        // `break;` will not work here, but look for better
-                        // alternative
-                        done = true;
-                    },
-                    cancel = rx2.recv().fuse() => {
+                    _ = tokio::time::delay_for(send_after).fuse() => break,
+                    cancel = rx.recv().fuse() => {
                         match cancel {
                             Some(true) => {
                                 debug!("cancelled timer");
                                 return;
                             },
-                            _ => {
-                                // only needed to handle `false` values, i.e. to
-                                // ignore initial state of the watch
-                            },
+
+                            // `false` should never be set, but ignore if received
+                            _ => {},
                         }
                     },
                 }
@@ -246,8 +248,10 @@ impl Server {
 
             // TODO: error handling
             debug!("Sending OSC command to: {}", &udp_addr);
-            socket2.send_to(&new_buf, &udp_addr).await.expect("send to failed!");
-            debug!("OSC command sent");
+            match socket.send_to(&new_buf, &udp_addr).await {
+                Ok(_) => debug!("OSC command sent"),
+                Err(err) => warn!("Failed to send UDP OSC message: {}", err),
+            }
         });
     }
 
