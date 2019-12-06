@@ -106,7 +106,7 @@ impl Server {
                     "/flush" => self.handle_msg_flush(&msg),
                     addr => {
                         let msg = format!("Ignoring unhandled OSC address: {}", addr);
-                        return Err(ServerError::ProtocolError(msg));
+                        return Err(ServerError::Protocol(msg));
                     }
                 }
             },
@@ -129,19 +129,19 @@ impl Server {
                                         ),
                                         Err(err) => {
                                             let msg = format!("Unexpected tag argument: {}", err);
-                                            return Err(ServerError::ProtocolError(msg));
+                                            return Err(ServerError::Protocol(msg));
                                         },
                                     }
                                 },
                                 addr => {
                                     let msg = format!("Unhandled OSC address: {}", addr);
-                                    return Err(ServerError::ProtocolError(msg));
+                                    return Err(ServerError::Protocol(msg));
                                 },
                             }
                         },
                         other => {
                             let msg = format!("Unexpected OSC bundle content: {:?}", other);
-                            return Err(ServerError::ProtocolError(msg));
+                            return Err(ServerError::Protocol(msg));
                         }
                     }
                 }
@@ -212,7 +212,7 @@ impl Server {
         };
 
         let (_tx, rx) = self.tags.entry(tag.to_owned())
-            .or_insert(tokio::sync::watch::channel(false));
+            .or_insert_with(|| tokio::sync::watch::channel(false));
         let mut rx = rx.clone();
 
         tokio::spawn(async move {
@@ -292,22 +292,22 @@ impl Server {
 #[derive(Debug)]
 enum ServerError {
     /// Network error, typically caused by UDP send/recv here.
-    IoError(io::Error),
+    Io(io::Error),
 
     /// OSC error, typically caused by failing to encode/decode OSC data structures.
-    OscError(rosc::OscError),
+    Osc(rosc::OscError),
 
     /// Error in cases where valid OSC packets were received, but containing invalid payloads (e.g.
     /// a `/send_after` containing unexpected arguments).
-    ProtocolError(String),
+    Protocol(String),
 }
 
 impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::IoError(err) => write!(f, "IO error: {}", err),
-            Self::OscError(err) => write!(f, "Failed to decode OSC packet: {:?}", err),
-            Self::ProtocolError(err) => write!(f, "{}", err),
+            Self::Io(err) => write!(f, "IO error: {}", err),
+            Self::Osc(err) => write!(f, "Failed to decode OSC packet: {:?}", err),
+            Self::Protocol(err) => write!(f, "{}", err),
         }
     }
 }
@@ -316,13 +316,13 @@ impl Error for ServerError {}
 
 impl From<io::Error> for ServerError {
     fn from(err: io::Error) -> Self {
-        Self::IoError(err)
+        Self::Io(err)
     }
 }
 
 impl From<rosc::OscError> for ServerError {
     fn from(err: rosc::OscError) -> Self {
-        Self::OscError(err)
+        Self::Osc(err)
     }
 }
 
@@ -331,7 +331,7 @@ impl From<rosc::OscError> for ServerError {
 async fn main() -> Result<(), io::Error> {
     env_logger::init();
 
-    let addr = env::args().nth(1).unwrap_or("127.0.0.1:4560".to_string());
+    let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:4560".to_string());
     Server::new(&addr).await?.run().await
 }
 
