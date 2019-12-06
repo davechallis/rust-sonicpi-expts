@@ -103,3 +103,6 @@ the tokio approach looks promising longer term.
 * desired failure modes (e.g. drop messages vs. late delivery)
 * desired configuration options
 * functionality of `/clock/sync` command?
+* what to do with time tags in the past - execute now, or discard?
+* OSC spec - 1.0 only, or 1.1 required?
+* will multiple messages ever be sent in bundles with same time tag?

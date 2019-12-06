@@ -327,3 +327,26 @@ async fn main() -> Result<(), io::Error> {
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:4560".to_string());
     Server::new(&addr).await?.run().await
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::timetag_to_unix;
+
+    #[test]
+    fn time_tag_to_unix_1() {
+        // 2^32 / 2 fractional seconds, i.e. 500,000μs
+        assert_eq!(timetag_to_unix(3_608_146_800, 2_147_483_648), (1_399_158_000, 500_000));
+    }
+
+    #[test]
+    fn time_tag_to_unix_2() {
+        assert_eq!(timetag_to_unix(3549086042, 4010129359), (1340097242, 933680));
+    }
+
+    #[test]
+    fn time_tag_to_unix_seconds_only() {
+        assert_eq!(timetag_to_unix(3_608_146_800, 0), (1_399_158_000, 0));
+    }
+
+    // TODO: tests for time tags in the past, invalid time tags, once error requirement determined
+}
